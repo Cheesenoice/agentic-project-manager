@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "ai-task-agent-backend"
+version = "0.1.0"
+description = "AI Task Management Agent Backend"
+authors = ["Author <author@example.com>"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.111.0"
+uvicorn = {extras = ["standard"], version = "^0.30.1"}
+sqlalchemy = "^2.0.31"
+aiosqlite = "^0.20.0"
+pydantic = "^2.7.4"
+langgraph = "^0.1.4"
+langchain-core = "^0.2.9"
+langchain-community = "^0.2.5"
+langchain-ollama = "^0.1.0"
+langchain-google-genai = "^1.0.7"
+apscheduler = "^3.10.4"
+python-multipart = "^0.0.9"
+python-dotenv = "^1.0.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
