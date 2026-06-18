@@ -86,7 +86,8 @@ async def chat_with_agent(project_id: int, chat_data: ChatRequest, db: AsyncSess
         "parsed_intent": None,
         "action_taken": "",
         "response": "",
-        "selected_agent": "supervisor"
+        "selected_agent": "supervisor",
+        "cv_text": chat_data.cv_text
     }
     
     try:

@@ -33,7 +33,7 @@ class ProjectDecomposition(BaseModel):
     tasks: List[DecomposedTask] = Field(description="Hierarchical list of tasks")
 
 class CoordinatorIntent(BaseModel):
-    action_type: str = Field(description="Action: 'update_status', 'assign_task', 'report_delay', 'create_task', or 'none'")
+    action_type: str = Field(description="Action: 'update_status', 'assign_task', 'report_delay', 'create_task', 'add_member', or 'none'")
     target_task_id: Optional[int] = Field(default=None, description="ID of the task to modify")
     new_status: Optional[str] = Field(default=None, description="todo, in_progress, qa_review, done, blocked")
     assignee_id: Optional[int] = Field(default=None, description="ID of the user to assign the task to")
@@ -47,6 +47,11 @@ class CoordinatorIntent(BaseModel):
     create_phase: Optional[str] = Field(default="development", description="phase")
     create_parent_id: Optional[int] = Field(default=None, description="Parent task ID")
     create_duration_days: Optional[int] = Field(default=2, description="Duration in days")
+
+    # Fields for adding a new member
+    new_member_username: Optional[str] = Field(default=None, description="Suggested lowercase alphanumeric username for the new member (e.g. dev_james)")
+    new_member_role: Optional[str] = Field(default=None, description="Role of the new member: developer, qa, pm, admin")
+    new_member_skills: Optional[str] = Field(default=None, description="Comma-separated skills list extracted from the CV (e.g. React, Python)")
 
 # ==========================================
 # 2. STATE DEFINITIONS
@@ -68,6 +73,7 @@ class CoordinatorState(TypedDict):
     action_taken: str
     response: str
     selected_agent: str
+    cv_text: Optional[str]
 
 
 # Initialize LLM dynamically to prevent event loop initialization errors
@@ -274,6 +280,10 @@ async def parse_intent_node(state: CoordinatorState):
         users = u_result.scalars().all()
         users_info = [{"id": u.id, "username": u.username, "role": u.role, "skills": u.skills} for u in users]
         
+    cv_context = ""
+    if state.get("cv_text"):
+        cv_context = f"\nAttached Candidate CV Text Context:\n{state['cv_text']}\n"
+
     prompt = f"""
     {agent_prompt}
     
@@ -283,6 +293,7 @@ async def parse_intent_node(state: CoordinatorState):
     Project ID: {project_id}
     Current Tasks: {tasks_info}
     Available Users: {users_info}
+    {cv_context}
     
     User Message: "{state['message']}"
     
@@ -291,6 +302,7 @@ async def parse_intent_node(state: CoordinatorState):
     - 'assign_task': user wants to assign a task. Set 'target_task_id'. Set 'assignee_id' if a user is mentioned, or set 'assign_by_skills': true if AI should auto-assign.
     - 'report_delay': user says a task is delayed. Set 'target_task_id' and 'delay_days' (integer).
     - 'create_task': user wants to add a new task/subtask. Set 'create_title', 'create_desc', 'create_type', 'create_phase', 'create_parent_id', 'create_duration_days'.
+    - 'add_member': user wants to add the candidate/person from the attached CV (or a specified person) as a new team member. Set 'new_member_username' (lowercase alphanumeric with underscore e.g. dev_james), 'new_member_role' (developer, qa, pm, admin), and 'new_member_skills' (comma-separated technical skills from the CV). If username is not explicitly provided, suggest a suitable username like dev_firstname_lastname or similar.
     - 'none': general question, chat, or no action.
     
     {coord_parser.get_format_instructions()}
@@ -409,7 +421,10 @@ async def execute_intent_node(state: CoordinatorState):
                                 skill_match = False
                                 if dev.skills and task.title:
                                     try:
-                                        dev_skills = json.loads(dev.skills)
+                                        if dev.skills.strip().startswith('['):
+                                            dev_skills = json.loads(dev.skills)
+                                        else:
+                                            dev_skills = [s.strip() for s in dev.skills.split(',') if s.strip()]
                                         for skill in dev_skills:
                                             if skill.lower() in task.title.lower() or (task.description and skill.lower() in task.description.lower()):
                                                 skill_match = True
@@ -475,7 +490,10 @@ async def execute_intent_node(state: CoordinatorState):
                                     skill_match = False
                                     if dev.skills and t.title:
                                         try:
-                                            dev_skills = json.loads(dev.skills)
+                                            if dev.skills.strip().startswith('['):
+                                                dev_skills = json.loads(dev.skills)
+                                            else:
+                                                dev_skills = [s.strip() for s in dev.skills.split(',') if s.strip()]
                                             for skill in dev_skills:
                                                 if skill.lower() in t.title.lower() or (t.description and skill.lower() in t.description.lower()):
                                                     skill_match = True
@@ -596,14 +614,51 @@ async def execute_intent_node(state: CoordinatorState):
                 else:
                     response_msg = "Could not create task. Missing title."
                     
-            else:
-                # None or Chat response: generate standard PM conversational response using supervisor custom prompt
-                selected_agent = state.get("selected_agent", "supervisor")
-                agent_key = selected_agent if selected_agent != "general_chat" else "supervisor"
+            elif action_type == "add_member":
+                username = intent.get("new_member_username")
+                role = intent.get("new_member_role") or "developer"
+                skills = intent.get("new_member_skills")
                 
-                a_res = await session.execute(select(AgentConfig).filter(AgentConfig.key == agent_key))
-                agent_cfg = a_res.scalar_one_or_none()
-                sys_prompt = agent_cfg.system_prompt if agent_cfg else "You are a helpful AI Project Manager."
+                if username:
+                    username = username.strip().lower()
+                    
+                if username:
+                    # Check if user already exists
+                    existing_res = await session.execute(
+                        select(User).filter(User.username == username)
+                    )
+                    existing = existing_res.scalar_one_or_none()
+                    if existing:
+                        response_msg = f"User @{username} already exists in the workspace. No new member was added."
+                        action_taken = f"Checked username @{username}, user already exists."
+                    else:
+                        # Convert comma-separated skills to JSON list string
+                        skills_json = None
+                        if skills:
+                            skills_list = [s.strip() for s in skills.split(",") if s.strip()]
+                            skills_json = json.dumps(skills_list)
+                            
+                        new_user = User(
+                            username=username,
+                            role=role,
+                            skills=skills_json
+                        )
+                        session.add(new_user)
+                        await session.flush()
+                        action_taken = f"Created new member @{username} via chat."
+                        response_msg = f"Successfully added new team member **@{username}** ({role.upper()}) with skills: {skills or 'none'}."
+                else:
+                    response_msg = "Could not add member: username is missing or could not be determined."
+                    
+            else:
+                # None or Chat response: generate standard PM conversational response
+                selected_agent = state.get("selected_agent", "supervisor")
+                if selected_agent == "general_chat":
+                    sys_prompt = "You are a helpful project coordinator. Answer general questions, greetings, or analyze the CV if one is attached in the context."
+                else:
+                    a_res = await session.execute(select(AgentConfig).filter(AgentConfig.key == selected_agent))
+                    agent_cfg = a_res.scalar_one_or_none()
+                    sys_prompt = agent_cfg.system_prompt if agent_cfg else "You are a helpful AI Project Manager."
                 
                 # Load tasks and users for context
                 t_result = await session.execute(select(Task).filter(Task.project_id == project_id))
@@ -619,13 +674,17 @@ async def execute_intent_node(state: CoordinatorState):
                 proj_name = proj.name if proj else ""
                 proj_desc = proj.description if proj else ""
 
+                cv_context = ""
+                if state.get("cv_text"):
+                    cv_context = f"\nAttached Candidate CV Text Context:\n{state['cv_text']}\n"
+
                 chat_prompt = f"""
                 Project Name: {proj_name}
                 Project Description: {proj_desc}
                 
                 Current Tasks Data: {tasks_info}
                 Available Users Data: {users_info}
-                
+                {cv_context}
                 User Request: "{state['message']}"
                 """
                 llm = get_llm()

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Brain, Trash2, Send, Plus, Bell, Layers, AlertCircle, RefreshCw, User as UserIcon, Clock, Filter } from 'lucide-react'
+import { Brain, Trash2, Send, Plus, Bell, Layers, AlertCircle, RefreshCw, User as UserIcon, Clock, Filter, Paperclip, X } from 'lucide-react'
 
 interface User {
   id: number
@@ -89,6 +89,7 @@ function App() {
   const [hrRole, setHRRole] = useState<'admin' | 'pm' | 'developer' | 'qa'>('developer')
   const [hrSkills, setHRSkills] = useState('')
   const [isHRSaving, setIsHRSaving] = useState(false)
+  const [isParsingCV, setIsParsingCV] = useState(false)
 
   // Agents Configuration State
   interface AgentConfig {
@@ -166,6 +167,8 @@ function App() {
     { sender: 'agent', text: 'AI Coordinator is ready. Enter your request, e.g. "update status of task DB Design to done" or "task Frontend Login is blocked".' }
   ])
   const [isChatLoading, setIsChatLoading] = useState(false)
+  const [chatCV, setChatCV] = useState<{ filename: string; text: string; skills?: string; username?: string } | null>(null)
+  const [isUploadingChatCV, setIsUploadingChatCV] = useState(false)
 
 
   // Status Indicators
@@ -487,7 +490,7 @@ function App() {
         if (usersRes.ok) {
           const uData = await usersRes.json();
           setUsers(uData);
-          if (editingHRUser && editingHRUser.id === activeUser?.id) {
+          if (editingHRUser && activeUser && editingHRUser.id === activeUser.id) {
             const updated = uData.find((u: User) => u.id === activeUser.id);
             if (updated) setActiveUser(updated);
           }
@@ -504,6 +507,50 @@ function App() {
       console.error(err);
     } finally {
       setIsHRSaving(false);
+    }
+  };
+
+  const handleParseCV = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsParsingCV(true);
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const res = await fetch('/api/users/parse-cv', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.skills) {
+          setHRSkills(data.skills);
+        }
+        if (data.username) {
+          setHRUsername(data.username);
+          if (data.username.startsWith('qa_')) {
+            setHRRole('qa');
+          } else if (data.username.startsWith('pm_')) {
+            setHRRole('pm');
+          } else if (data.username.startsWith('admin_')) {
+            setHRRole('admin');
+          } else {
+            setHRRole('developer');
+          }
+        }
+      } else {
+        const err = await res.json();
+        alert(`Error parsing CV: ${err.detail || "Failed to extract skills"}`);
+      }
+    } catch (err) {
+      console.error(err);
+      alert("An error occurred while uploading CV.");
+    } finally {
+      setIsParsingCV(false);
+      e.target.value = '';
     }
   };
 
@@ -554,7 +601,8 @@ function App() {
         body: JSON.stringify({ 
           message: textToSend, 
           role: activeUser?.role || 'pm',
-          forced_agent: chatForcedAgent 
+          forced_agent: chatForcedAgent,
+          cv_text: chatCV?.text || null
         })
       })
       if (res.ok) {
@@ -575,6 +623,46 @@ function App() {
     }
 
   }
+
+  const handleUploadChatCV = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsUploadingChatCV(true);
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const res = await fetch('/api/users/parse-cv', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        setChatCV({
+          filename: file.name,
+          text: data.raw_text || '',
+          skills: data.skills,
+          username: data.username
+        });
+        
+        setChatHistory(prev => [...prev, {
+          sender: 'agent',
+          text: `📄 **CV Loaded successfully:** \n* **Filename:** ${file.name}\n* **Extracted Username:** @${data.username}\n* **Skills:** ${data.skills || 'none'}\n\nYou can now ask me questions about this CV or ask me to "thêm member này" (add this member).`
+        }]);
+      } else {
+        const err = await res.json();
+        alert(`Error parsing CV: ${err.detail || "Failed to extract skills"}`);
+      }
+    } catch (err) {
+      console.error(err);
+      alert("An error occurred while uploading CV.");
+    } finally {
+      setIsUploadingChatCV(false);
+      e.target.value = '';
+    }
+  };
 
   // Mark notification as read
   const handleReadNotification = async (id: number) => {
@@ -2040,38 +2128,64 @@ function App() {
                       </div>
 
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                        <label style={{ fontSize: '0.72rem', fontWeight: 700, color: '#475569' }}>SKILLS & TECH STACK</label>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <label style={{ fontSize: '0.72rem', fontWeight: 700, color: '#475569' }}>SKILLS & TECH STACK</label>
+                          <label style={{ 
+                            fontSize: '0.7rem', 
+                            color: isParsingCV ? '#64748b' : '#4f46e5', 
+                            fontWeight: 600, 
+                            cursor: isParsingCV ? 'not-allowed' : 'pointer',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            background: isParsingCV ? 'rgba(100, 116, 139, 0.08)' : 'rgba(79, 70, 229, 0.08)',
+                            padding: '3px 8px',
+                            borderRadius: '4px',
+                            transition: 'all 0.2s'
+                          }}>
+                            {isParsingCV ? '⚡ Parsing CV...' : '📄 Upload CV'}
+                            <input 
+                              type="file" 
+                              accept=".pdf,.txt" 
+                              onChange={handleParseCV} 
+                              disabled={isParsingCV}
+                              style={{ display: 'none' }} 
+                            />
+                          </label>
+                        </div>
                         <input 
                           type="text" 
-                          placeholder="e.g. React, TypeScript, Python, SQL" 
+                          placeholder={isParsingCV ? "Extracting skills..." : "e.g. React, TypeScript, Python, SQL"} 
                           value={hrSkills}
                           onChange={e => setHRSkills(e.target.value)}
-                          style={{ width: '100%', background: '#f8fafc', border: '1px solid rgba(0,0,0,0.08)', borderRadius: '6px', padding: '8px 10px', fontSize: '0.8rem', outline: 'none' }}
+                          disabled={isParsingCV}
+                          style={{ width: '100%', background: '#f8fafc', border: '1px solid rgba(0,0,0,0.08)', borderRadius: '6px', padding: '8px 10px', fontSize: '0.8rem', outline: 'none', opacity: isParsingCV ? 0.7 : 1 }}
                         />
-                        <span style={{ fontSize: '0.65rem', color: '#64748b' }}>Enter skills separated by commas. These will be analyzed by the AI Coordinator for auto-allocation.</span>
+                        <span style={{ fontSize: '0.65rem', color: '#64748b' }}>Enter skills separated by commas, or upload a CV to auto-fill them.</span>
                       </div>
 
                       <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', borderTop: '1px solid rgba(0,0,0,0.06)', paddingTop: '12px', marginTop: '4px' }}>
                         {editingHRUser && (
                           <button 
                             type="button"
+                            disabled={isHRSaving || isParsingCV}
                             onClick={() => {
                               setEditingHRUser(null);
                               setHRUsername('');
                               setHRRole('developer');
                               setHRSkills('');
                             }}
-                            style={{ background: '#f1f5f9', color: '#475569', border: '1px solid rgba(0,0,0,0.06)', borderRadius: '6px', padding: '8px 16px', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer' }}
+                            style={{ background: '#f1f5f9', color: '#475569', border: '1px solid rgba(0,0,0,0.06)', borderRadius: '6px', padding: '8px 16px', fontSize: '0.8rem', fontWeight: 600, cursor: (isHRSaving || isParsingCV) ? 'not-allowed' : 'pointer', opacity: (isHRSaving || isParsingCV) ? 0.6 : 1 }}
                           >
                             Cancel
                           </button>
                         )}
                         <button 
                           type="submit" 
-                          disabled={isHRSaving}
-                          style={{ background: '#4f46e5', color: '#ffffff', border: 'none', borderRadius: '6px', padding: '8px 20px', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer', opacity: isHRSaving ? 0.7 : 1 }}
+                          disabled={isHRSaving || isParsingCV}
+                          style={{ background: '#4f46e5', color: '#ffffff', border: 'none', borderRadius: '6px', padding: '8px 20px', fontSize: '0.8rem', fontWeight: 600, cursor: (isHRSaving || isParsingCV) ? 'not-allowed' : 'pointer', opacity: (isHRSaving || isParsingCV) ? 0.7 : 1 }}
                         >
-                          {isHRSaving ? "Saving..." : editingHRUser ? "Update Member" : "Add Member"}
+                          {isHRSaving ? "Saving..." : isParsingCV ? "Parsing..." : editingHRUser ? "Update Member" : "Add Member"}
                         </button>
                       </div>
                     </form>
@@ -2233,20 +2347,74 @@ function App() {
               </div>
             )}
 
+            {/* CV attachment status */}
+            {chatCV && (
+              <div style={{ 
+                display: 'flex', 
+                alignItems: 'center', 
+                justifyContent: 'space-between', 
+                background: '#f0fdf4', 
+                border: '1px solid #bbf7d0', 
+                borderRadius: '6px', 
+                padding: '6px 10px', 
+                marginBottom: '6px', 
+                fontSize: '0.75rem', 
+                color: '#166534' 
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden' }}>
+                  <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>📄 CV: <strong>{chatCV.filename}</strong></span>
+                  {chatCV.username && (
+                    <span style={{ fontSize: '0.65rem', background: '#dcfce7', padding: '1px 4px', borderRadius: '3px', whiteSpace: 'nowrap' }}>
+                      @{chatCV.username}
+                    </span>
+                  )}
+                </div>
+                <button 
+                  type="button" 
+                  onClick={() => setChatCV(null)}
+                  style={{ background: 'none', border: 'none', color: '#166534', cursor: 'pointer', display: 'flex', alignItems: 'center', padding: 0 }}
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            )}
+
             {/* Input field */}
             <form onSubmit={handleSendChat} style={{ display: 'flex', gap: '6px' }}>
+              <label style={{ 
+                background: isUploadingChatCV ? '#f1f5f9' : '#f8fafc', 
+                border: '1px solid rgba(0,0,0,0.08)', 
+                borderRadius: '6px', 
+                width: '34px', 
+                height: '34px', 
+                cursor: isUploadingChatCV ? 'not-allowed' : 'pointer', 
+                display: 'flex', 
+                alignItems: 'center', 
+                justifyContent: 'center', 
+                flexShrink: 0,
+                color: isUploadingChatCV ? '#94a3b8' : '#475569'
+              }}>
+                <Paperclip size={14} />
+                <input 
+                  type="file" 
+                  accept=".pdf,.txt" 
+                  disabled={isUploadingChatCV}
+                  onChange={handleUploadChatCV} 
+                  style={{ display: 'none' }} 
+                />
+              </label>
               <input 
                 type="text" 
-                placeholder="e.g. assign task 2 to dev..." 
+                placeholder={isUploadingChatCV ? "Parsing CV..." : "e.g. assign task 2 to dev..."} 
                 value={chatMessage}
                 onChange={e => setChatMessage(e.target.value)}
-                disabled={!activeProject || isChatLoading}
+                disabled={!activeProject || isChatLoading || isUploadingChatCV}
                 style={{ flex: 1, background: '#ffffff', border: '1px solid rgba(0,0,0,0.08)', borderRadius: '6px', padding: '8px 10px', color: '#0f172a', fontSize: '0.8rem', outline: 'none' }}
               />
               <button 
                 type="submit" 
                 className="tactile-btn"
-                disabled={!activeProject || isChatLoading}
+                disabled={!activeProject || isChatLoading || isUploadingChatCV}
                 style={{ background: '#4f46e5', color: '#ffffff', border: 'none', borderRadius: '6px', width: '34px', height: '34px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, boxShadow: '0 2px 4px rgba(79, 70, 229, 0.15)' }}
               >
                 <Send size={13} strokeWidth={2.5} />

@@ -96,6 +96,7 @@ class ChatRequest(BaseModel):
     message: str
     role: Optional[str] = "pm"
     forced_agent: Optional[str] = None
+    cv_text: Optional[str] = None
 
 
 
