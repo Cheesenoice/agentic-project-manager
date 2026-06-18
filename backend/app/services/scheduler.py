@@ -24,12 +24,15 @@ async def check_deadlines_job():
         
         for task in tasks:
             print(f"Checking Task ID={task.id}, Title={task.title}, Due={task.due_date}")
+            tag = f"@{task.assigned_to.username}" if task.assigned_to else "Unassigned"
             # 1. Overdue check
             if task.due_date < now:
-                msg = f"Task '{task.title}' is OVERDUE! (Due: {task.due_date.strftime('%Y-%m-%d %H:%M')})"
+                due_gmt7 = task.due_date + timedelta(hours=7)
+                msg = f"Task '{task.title}' is OVERDUE! Assigned to: {tag} (Due: {due_gmt7.strftime('%Y-%m-%d %H:%M')})"
             # 2. Approaching due date check (within 24 hours)
             elif task.due_date <= now + timedelta(hours=24):
-                msg = f"Task '{task.title}' is due soon! (Due: {task.due_date.strftime('%Y-%m-%d %H:%M')})"
+                due_gmt7 = task.due_date + timedelta(hours=7)
+                msg = f"Task '{task.title}' is due soon! Assigned to: {tag} (Due: {due_gmt7.strftime('%Y-%m-%d %H:%M')})"
             else:
                 continue
             

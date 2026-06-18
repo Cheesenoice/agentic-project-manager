@@ -9,8 +9,9 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 from app.config import settings
 from app.db import async_session
-from app.models.models import Project, Task, User, Notification
+from app.models.models import Project, Task, User, Notification, AgentConfig
 from sqlalchemy.future import select
+
 from sqlalchemy.orm import selectinload
 
 # ==========================================
@@ -62,9 +63,12 @@ class CoordinatorState(TypedDict):
     project_id: int
     user_role: str
     message: str
+    forced_agent: Optional[str]
     parsed_intent: Optional[dict]
     action_taken: str
     response: str
+    selected_agent: str
+
 
 # Initialize LLM dynamically to prevent event loop initialization errors
 def get_llm():
@@ -192,10 +196,74 @@ async def save_tasks_node(state: AgentState):
 # 4. COORDINATOR AGENT NODES (CHAT / UPDATES)
 # ==========================================
 
+async def supervisor_node(state: CoordinatorState):
+    forced_agent = state.get("forced_agent")
+    if forced_agent and forced_agent != "supervisor":
+        print(f"[SUPERVISOR] Forced routing to agent: {forced_agent}")
+        return {"selected_agent": forced_agent}
+        
+    # Auto-routing using LLM
+    async with async_session() as session:
+        result = await session.execute(select(AgentConfig))
+        agents = result.scalars().all()
+        
+    agents_list = []
+    for a in agents:
+        if a.key != "supervisor":
+            agents_list.append(f"- '{a.key}': {a.description}")
+            
+    agents_str = "\n".join(agents_list)
+    
+    prompt = f"""
+    You are the Supervisor Agent. Your task is to analyze the user query and route it to one of the following specialized sub-agents:
+    
+    {agents_str}
+    
+    User Query: "{state['message']}"
+    
+    Respond ONLY with a JSON object conforming to the schema:
+    {{
+      "route_to": "decomposer" | "allocator" | "delay_shifter" | "health_analyst" | "general_chat",
+      "reason": "Brief reason for this choice"
+    }}
+    
+    No markdown code blocks, just raw JSON.
+    """
+    
+    llm = get_llm()
+    try:
+        response = await llm.ainvoke([
+            SystemMessage(content="You are a strict JSON router. Output ONLY raw JSON conforming to the schema."),
+            HumanMessage(content=prompt)
+        ])
+        content = response.content.strip()
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.endswith("```"):
+            content = content[:-3]
+        
+        choice = json.loads(content)
+        route_to = choice.get("route_to", "general_chat")
+        print(f"[SUPERVISOR] Auto-routed to agent: {route_to} (Reason: {choice.get('reason')})")
+        return {"selected_agent": route_to}
+    except Exception as e:
+        print(f"[SUPERVISOR] Routing error: {e}, defaulting to general_chat")
+        return {"selected_agent": "general_chat"}
+
 async def parse_intent_node(state: CoordinatorState):
     project_id = state["project_id"]
+    selected_agent = state.get("selected_agent", "supervisor")
     
+    # If general_chat, skip intent parsing to save API calls
+    if selected_agent == "general_chat":
+        return {"parsed_intent": {"action_type": "none"}}
+        
     async with async_session() as session:
+        # Load agent custom prompt from DB
+        res = await session.execute(select(AgentConfig).filter(AgentConfig.key == selected_agent))
+        agent_cfg = res.scalar_one_or_none()
+        agent_prompt = agent_cfg.system_prompt if agent_cfg else "You are a helpful project coordinator."
+        
         # Load tasks
         t_result = await session.execute(select(Task).filter(Task.project_id == project_id))
         tasks = t_result.scalars().all()
@@ -207,8 +275,9 @@ async def parse_intent_node(state: CoordinatorState):
         users_info = [{"id": u.id, "username": u.username, "role": u.role, "skills": u.skills} for u in users]
         
     prompt = f"""
-    You are an AI Coordinator. Analyze the user's message and current project data.
-    Identify the requested action and populate the JSON response.
+    {agent_prompt}
+    
+    Analyze the user's message and current project data to extract the requested structured action.
     
     User Role: {state['user_role']}
     Project ID: {project_id}
@@ -231,7 +300,6 @@ async def parse_intent_node(state: CoordinatorState):
     
     llm = get_llm()
     response = await llm.ainvoke([
-
         SystemMessage(content="You are a strict parser. Output ONLY raw JSON conforming to the schema. No markdown code blocks."),
         HumanMessage(content=prompt)
     ])
@@ -244,7 +312,7 @@ async def parse_intent_node(state: CoordinatorState):
             content = content[:-3]
         intent = coord_parser.parse(content)
     except Exception as e:
-        print(f"Coordinator Parse Error: {e}")
+        print(f"Coordinator Parse Error for agent {selected_agent}: {e}")
         intent = {"action_type": "none"}
         
     return {"parsed_intent": intent}
@@ -315,15 +383,23 @@ async def execute_intent_node(state: CoordinatorState):
                     if task:
                         target_user = None
                         if assign_by_skills:
-                            # Auto assign: get all developers
-                            u_result = await session.execute(select(User).filter(User.role == "developer"))
-                            developers = u_result.scalars().all()
+                            # Decide role filter based on task keywords/phase
+                            is_qa = (task.phase == "testing" or 
+                                     any(keyword in task.title.lower() or (task.description and keyword in task.description.lower())
+                                         for keyword in ["qa", "testing", "test", "review"]))
+                            role_filter = "qa" if is_qa else "developer"
+                            
+                            u_result = await session.execute(select(User).filter(User.role == role_filter))
+                            candidates = u_result.scalars().all()
+                            if not candidates and role_filter == "qa":
+                                u_result = await session.execute(select(User).filter(User.role == "developer"))
+                                candidates = u_result.scalars().all()
                             
                             # Fetch current tasks workload (number of non-done tasks)
                             best_user = None
                             min_workload = float('inf')
                             
-                            for dev in developers:
+                            for dev in candidates:
                                 workload_result = await session.execute(
                                     select(Task).filter(Task.assigned_to_id == dev.id, Task.status != "done")
                                 )
@@ -356,15 +432,12 @@ async def execute_intent_node(state: CoordinatorState):
                             action_taken = f"Assigned task {task_id} to user {target_user.username}."
                             response_msg = f"Task '{task.title}' has been successfully assigned to **{target_user.username}**."
                         else:
-                            response_msg = "No suitable developer was found or specified."
+                            response_msg = "No suitable user was found or specified."
                     else:
                         response_msg = "Task not found."
                 else:
                     if assign_by_skills:
                         # Auto assign all unassigned tasks in project
-                        u_result = await session.execute(select(User).filter(User.role == "developer"))
-                        developers = u_result.scalars().all()
-                        
                         tasks_result = await session.execute(
                             select(Task).filter(
                                 Task.project_id == project_id,
@@ -380,9 +453,20 @@ async def execute_intent_node(state: CoordinatorState):
                         else:
                             assigned_info = []
                             for t in unassigned_tasks:
+                                is_qa = (t.phase == "testing" or 
+                                         any(keyword in t.title.lower() or (t.description and keyword in t.description.lower())
+                                             for keyword in ["qa", "testing", "test", "review"]))
+                                role_filter = "qa" if is_qa else "developer"
+                                
+                                u_result = await session.execute(select(User).filter(User.role == role_filter))
+                                candidates = u_result.scalars().all()
+                                if not candidates and role_filter == "qa":
+                                    u_result = await session.execute(select(User).filter(User.role == "developer"))
+                                    candidates = u_result.scalars().all()
+                                
                                 best_user = None
                                 min_workload = float('inf')
-                                for dev in developers:
+                                for dev in candidates:
                                     workload_result = await session.execute(
                                         select(Task).filter(Task.assigned_to_id == dev.id, Task.status != "done")
                                     )
@@ -429,7 +513,8 @@ async def execute_intent_node(state: CoordinatorState):
                             task.start_date = task.start_date + timedelta(days=delay_days)
                             
                         action_taken = f"Shifted task {task_id} schedule by {delay_days} days."
-                        response_msg = f"Shifted Task '{task.title}' due date to **{task.due_date.strftime('%Y-%m-%d %H:%M')}**."
+                        due_gmt7 = task.due_date + timedelta(hours=7)
+                        response_msg = f"Shifted Task '{task.title}' due date to **{due_gmt7.strftime('%Y-%m-%d %H:%M')}**."
                         
                         # Recursive shift of dependent tasks
                         async def shift_dependents(parent_t_id, days):
@@ -512,20 +597,46 @@ async def execute_intent_node(state: CoordinatorState):
                     response_msg = "Could not create task. Missing title."
                     
             else:
-                # None or Chat response: generate standard PM conversational response
+                # None or Chat response: generate standard PM conversational response using supervisor custom prompt
+                selected_agent = state.get("selected_agent", "supervisor")
+                agent_key = selected_agent if selected_agent != "general_chat" else "supervisor"
+                
+                a_res = await session.execute(select(AgentConfig).filter(AgentConfig.key == agent_key))
+                agent_cfg = a_res.scalar_one_or_none()
+                sys_prompt = agent_cfg.system_prompt if agent_cfg else "You are a helpful AI Project Manager."
+                
+                # Load tasks and users for context
+                t_result = await session.execute(select(Task).filter(Task.project_id == project_id))
+                tasks = t_result.scalars().all()
+                tasks_info = [{"id": t.id, "title": t.title, "status": t.status, "assigned_to_id": t.assigned_to_id, "type": t.task_type, "due_date": t.due_date.isoformat() if t.due_date else None} for t in tasks]
+                
+                u_result = await session.execute(select(User))
+                users = u_result.scalars().all()
+                users_info = [{"id": u.id, "username": u.username, "role": u.role, "skills": u.skills} for u in users]
+                
+                proj_result = await session.execute(select(Project).filter(Project.id == project_id))
+                proj = proj_result.scalar_one_or_none()
+                proj_name = proj.name if proj else ""
+                proj_desc = proj.description if proj else ""
+
                 chat_prompt = f"""
-                You are a helpful AI Project Manager. Respond to the user request.
+                Project Name: {proj_name}
+                Project Description: {proj_desc}
+                
+                Current Tasks Data: {tasks_info}
+                Available Users Data: {users_info}
+                
                 User Request: "{state['message']}"
-                Answer concisely in Vietnamese or English based on the user language.
                 """
                 llm = get_llm()
                 chat_resp = await llm.ainvoke([
-
-                    SystemMessage(content="You are a helpful project assistant. Respond directly without conversational filler."),
+                    SystemMessage(content=sys_prompt),
                     HumanMessage(content=chat_prompt)
                 ])
                 response_msg = chat_resp.content
-                action_taken = "Generated conversational answer."
+                action_taken = f"Responded via {agent_key} agent."
+
+
 
     return {
         "action_taken": action_taken,
@@ -547,10 +658,13 @@ agent_app = decomp_wf.compile()
 
 # 2. Coordinator Graph
 coord_wf = StateGraph(CoordinatorState)
+coord_wf.add_node("supervisor", supervisor_node)
 coord_wf.add_node("parse", parse_intent_node)
 coord_wf.add_node("execute", execute_intent_node)
-coord_wf.set_entry_point("parse")
+coord_wf.set_entry_point("supervisor")
+coord_wf.add_edge("supervisor", "parse")
 coord_wf.add_edge("parse", "execute")
 coord_wf.add_edge("execute", END)
 coordinator_app = coord_wf.compile()
+
 

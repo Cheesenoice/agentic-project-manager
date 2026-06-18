@@ -80,11 +80,26 @@ class NotificationResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+class CommentCreate(BaseModel):
+    content: str
+
+class CommentResponse(BaseModel):
+    id: int
+    task_id: int
+    sender: str
+    content: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
 class ChatRequest(BaseModel):
     message: str
     role: Optional[str] = "pm"
+    forced_agent: Optional[str] = None
+
 
 
 # Rebuild model to support recursive references
 TaskResponse.model_rebuild()
+
 

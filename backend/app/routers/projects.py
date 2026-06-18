@@ -82,20 +82,25 @@ async def chat_with_agent(project_id: int, chat_data: ChatRequest, db: AsyncSess
         "project_id": project_id,
         "user_role": chat_data.role or "pm",
         "message": chat_data.message,
+        "forced_agent": chat_data.forced_agent,
         "parsed_intent": None,
         "action_taken": "",
-        "response": ""
+        "response": "",
+        "selected_agent": "supervisor"
     }
     
     try:
         final_state = await coordinator_app.ainvoke(initial_state)
         return {
             "response": final_state["response"],
-            "action_taken": final_state["action_taken"]
+            "action_taken": final_state["action_taken"],
+            "selected_agent": final_state.get("selected_agent", "supervisor")
         }
     except Exception as e:
         return {
             "response": f"Sorry, I encountered an error processing your request: {str(e)}",
-            "action_taken": "Error"
+            "action_taken": "Error",
+            "selected_agent": "supervisor"
         }
+
 

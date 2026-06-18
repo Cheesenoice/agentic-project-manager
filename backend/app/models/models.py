@@ -55,7 +55,7 @@ class Task(Base):
         back_populates="parent", 
         cascade="all, delete-orphan", 
         lazy="selectin",
-        join_depth=2
+        join_depth=4
     )
     parent: Mapped[Optional["Task"]] = relationship(
         "Task", 
@@ -83,5 +83,27 @@ class TaskHistory(Base):
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
     state_json: Mapped[str] = mapped_column(Text, nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class TaskComment(Base):
+    __tablename__ = "task_comments"
+    
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    sender: Mapped[str] = mapped_column(String(50), nullable=False) # "user" or "ai_coordinator"
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AgentConfig(Base):
+    __tablename__ = "agent_configs"
+    
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    key: Mapped[str] = mapped_column(String(50), unique=True, index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+
+
 
 

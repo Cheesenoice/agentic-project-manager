@@ -102,6 +102,10 @@ async def check_subtask_rollup(db: AsyncSession, parent_id: int):
             from app.services.telegram import send_telegram_message
             await send_telegram_message(f"<b>[SUBTASK ROLLUP]</b>\n{msg}")
             
+            # Trigger AI Routing for the rolled-up parent task
+            from app.services.routing import run_ai_routing_decision
+            await run_ai_routing_decision(db, parent_task.id)
+            
             if parent_task.parent_id:
                 await check_subtask_rollup(db, parent_task.parent_id)
 
@@ -158,6 +162,15 @@ async def update_task(task_id: int, task_data: TaskUpdate, db: AsyncSession = De
     for key, val in update_dict.items():
         setattr(db_task, key, val)
 
+    # If task is changed to "qa_review", auto assign to first QA user in DB
+    if "status" in update_dict and update_dict["status"] == "qa_review":
+        from app.models.models import User
+        qa_res = await db.execute(select(User).filter(User.role == "qa"))
+        qa_user = qa_res.scalar_one_or_none()
+        if qa_user:
+            db_task.assigned_to_id = qa_user.id
+            print(f"[QA ROUTING] Auto-assigned task {task_id} to QA User {qa_user.username}")
+
     # Perform cascading shifts
     if days_shift > 0.01:
         await cascade_task_delay(db, project_id, task_id, days_shift)
@@ -167,10 +180,31 @@ async def update_task(task_id: int, task_data: TaskUpdate, db: AsyncSession = De
         await db.flush()
         await check_subtask_rollup(db, parent_id)
 
-    # Trigger telegram alert if manual status is changed to done
-    if "status" in update_dict and update_dict["status"] == "done" and old_status != "done":
+    # Trigger telegram alert if status changed
+    if "status" in update_dict and update_dict["status"] != old_status:
         from app.services.telegram import send_telegram_message
-        await send_telegram_message(f"<b>[TASK COMPLETED]</b>\nTask '{db_task.title}' (ID: {task_id}) has been completed.")
+        new_stat = update_dict["status"]
+        if new_stat == "qa_review":
+            from app.models.models import User
+            qa_res = await db.execute(select(User).filter(User.role == "qa"))
+            qa_user = qa_res.scalar_one_or_none()
+            qa_tag = f"@{qa_user.username}" if qa_user else "@qa_charlie"
+            await send_telegram_message(
+                f"🚨 <b>[QA REVIEW REQUESTED]</b>\n"
+                f"Task: '{db_task.title}' (ID: {task_id})\n"
+                f"🔔 Attention: {qa_tag} - Please verify this task."
+            )
+        elif new_stat == "done":
+            await send_telegram_message(f"✅ <b>[TASK COMPLETED]</b>\nTask '{db_task.title}' (ID: {task_id}) has been completed.")
+            # Trigger AI Routing for completed task
+            from app.services.routing import run_ai_routing_decision
+            await run_ai_routing_decision(db, task_id)
+        else:
+            await send_telegram_message(
+                f"⚙️ <b>[STATUS UPDATE]</b>\n"
+                f"Task: '{db_task.title}' (ID: {task_id})\n"
+                f"Transition: <code>{old_status}</code> ➡️ <code>{new_stat}</code>"
+            )
 
     await db.commit()
     await db.refresh(db_task)

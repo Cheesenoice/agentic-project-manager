@@ -66,15 +66,46 @@ async def create_status_report(task_id: int, payload: ReportRequest, db: AsyncSe
     # 3. Update status
     task.status = new_status
 
+    # If task is changed to "qa_review", auto assign to first QA user in DB
+    if new_status == "qa_review":
+        from app.models.models import User
+        qa_res = await db.execute(select(User).filter(User.role == "qa"))
+        qa_user = qa_res.scalar_one_or_none()
+        if qa_user:
+            task.assigned_to_id = qa_user.id
+            print(f"[QA ROUTING] Auto-assigned task {task_id} to QA User {qa_user.username}")
+
     # 4. Rollup check
     if new_status == "done" and parent_id:
         await db.flush()
         await check_subtask_rollup(db, parent_id)
 
-    # 5. Telegram alert for task completion
-    if new_status == "done" and old_status != "done":
+    # 5. Telegram alert for status changes
+    if new_status != old_status:
         from app.services.telegram import send_telegram_message
-        await send_telegram_message(f"<b>[TASK COMPLETED]</b>\nTask '{task.title}' (ID: {task_id}) has been completed.\nReport: <i>{user_report}</i>")
+        if new_status == "qa_review":
+            from app.models.models import User
+            qa_res = await db.execute(select(User).filter(User.role == "qa"))
+            qa_user = qa_res.scalar_one_or_none()
+            qa_tag = f"@{qa_user.username}" if qa_user else "@qa_charlie"
+            await send_telegram_message(
+                f"🚨 <b>[QA REVIEW REQUESTED]</b>\n"
+                f"Task: '{task.title}' (ID: {task_id})\n"
+                f"Report: <i>{user_report}</i>\n"
+                f"🔔 Attention: {qa_tag} - Please verify this task."
+            )
+        elif new_status == "done":
+            await send_telegram_message(f"✅ <b>[TASK COMPLETED]</b>\nTask '{task.title}' (ID: {task_id}) has been completed.\nReport: <i>{user_report}</i>")
+            # Trigger AI Routing for completed task
+            from app.services.routing import run_ai_routing_decision
+            await run_ai_routing_decision(db, task_id)
+        else:
+            await send_telegram_message(
+                f"⚙️ <b>[STATUS UPDATE]</b>\n"
+                f"Task: '{task.title}' (ID: {task_id})\n"
+                f"Report: <i>{user_report}</i>\n"
+                f"Transition: <code>{old_status}</code> ➡️ <code>{new_status}</code>"
+            )
 
     await db.commit()
     await db.refresh(task)
@@ -127,3 +158,56 @@ async def create_status_report(task_id: int, payload: ReportRequest, db: AsyncSe
         },
         "ai_recommendation": recommendation
     }
+
+@router.post("/tasks/{task_id}/draft-report")
+async def draft_status_report(
+    task_id: int, 
+    target_status: Optional[str] = None, 
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(select(Task).filter(Task.id == task_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    status_name = target_status or task.status
+    prompt = f"""
+    You are the AI Project Coordinator.
+    Draft exactly 3 alternative, extremely short and simple progress report sentences in English for the task "{task.title}" transitioning to status "{status_name}".
+    Guidelines:
+    - Keep each option extremely short (under 8 words) and simple.
+    - Do not describe in detail.
+    - Output ONLY a JSON list of 3 strings. Do not write markdown or any explanations.
+    """
+
+    try:
+        llm = get_llm()
+        response = await llm.ainvoke([
+            SystemMessage(content="You are a helpful assistant. Output ONLY a valid JSON array of 3 short strings directly, without markdown or explanations."),
+            HumanMessage(content=prompt)
+        ])
+        content = response.content.strip()
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.endswith("```"):
+            content = content[:-3]
+        suggestions = json.loads(content.strip())
+        if not isinstance(suggestions, list) or len(suggestions) == 0:
+            raise ValueError("Invalid format")
+    except Exception as e:
+        print(f"Draft Report Error: {e}")
+        # fallback based on target_status
+        if status_name == "in_progress":
+            suggestions = ["Started working on task.", "Began task development.", "Now in progress."]
+        elif status_name == "qa_review":
+            suggestions = ["Ready for QA review.", "Submitted for testing.", "QA validation needed."]
+        elif status_name == "done":
+            suggestions = ["Completed task successfully.", "Finished all requirements.", "Task complete."]
+        elif status_name == "blocked":
+            suggestions = ["Work is blocked.", "Pending external dependencies.", "Encountered blockers."]
+        else:
+            suggestions = [f"Updated {task.title}.", "Status changed.", "Progressing on task."]
+
+    draft = suggestions[0] if suggestions else f"Updated {task.title}."
+    return {"draft": draft, "suggestions": suggestions}
+
